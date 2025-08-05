@@ -1,0 +1,5 @@
+Flask==2.3.2
+flask-bcrypt==1.0.1
+python-dotenv==1.0.1
+xendit-python==2.6.0
+gunicorn==21.2.0
