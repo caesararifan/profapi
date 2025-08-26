@@ -14,6 +14,7 @@ class PaymentStatus(enum.Enum):
     PAID = "paid"
     FAILED = "failed"
     EXPIRED = "expired"
+    WAITING_MANUAL_PAYMENT = 'WAITING_MANUAL_PAYMENT'
 
 class InvoiceStatus(enum.Enum):
     PENDING = "pending"
@@ -44,6 +45,7 @@ class Event(db.Model):
     end_time = db.Column(db.Time, nullable=False)
     is_active = db.Column(db.Boolean, default=True, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    image_url = db.Column(db.String(255), nullable=True)
 
     def __repr__(self):
         return f"<Event {self.name}>"
@@ -106,13 +108,14 @@ class Invoice(db.Model):
 class Reservation(db.Model):
     __tablename__ = 'reservations'
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False) # TIPE DATA DIPERBAIKI
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False) 
     event_table_id = db.Column(db.Integer, db.ForeignKey('event_tables.id'), nullable=False)
-    invoice_id = db.Column(db.String(36), db.ForeignKey('invoices.id'), nullable=True, unique=True) # Menyatukan pembayaran
+    invoice_id = db.Column(db.String(36), db.ForeignKey('invoices.id'), nullable=True, unique=True)
     number_of_guests = db.Column(db.Integer, nullable=False)
-    total_amount = db.Column(db.Integer, nullable=False) # Total harga (dalam integer)
+    total_amount = db.Column(db.Integer, nullable=False)
     payment_status = db.Column(db.Enum(PaymentStatus), default=PaymentStatus.PENDING, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    arrival_time = db.Column(db.Time, nullable=True)
 
     # Relationships
     user = db.relationship('User', backref=db.backref('reservations', lazy='dynamic'))

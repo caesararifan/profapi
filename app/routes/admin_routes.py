@@ -1,11 +1,14 @@
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required
-from app.models import Event,EventTable, EventTableStatus, Table, Product
+from app.models import Event,EventTable, EventTableStatus, Table, Product, PaymentStatus, Ticket, Reservation
+import uuid
 from app import db
 from app import db
 from app.utils import require_api_key, require_admin_role
 from datetime import datetime
-# import uuid
+import os
+import json
+from werkzeug.utils import secure_filename
 
 # Membuat Blueprint baru untuk admin
 admin_bp = Blueprint('admin', __name__, url_prefix='/admin')
@@ -15,79 +18,125 @@ def index():
     """Endpoint dasar untuk mengecek apakah API berjalan."""
     return jsonify({"status": "ok", "message": "API Anda berjalan dengan baik!"})
 
+def allowed_file(filename):
+    """Fungsi helper untuk memeriksa ekstensi file yang diizinkan."""
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in current_app.config['ALLOWED_EXTENSIONS']
+
 @admin_bp.route("/create-event", methods=["POST"])
 @require_api_key
 @jwt_required()
 @require_admin_role
 def create_event():
-    """Endpoint untuk admin membuat event baru + generate table mapping."""
-    data = request.get_json()
+    """Endpoint untuk admin membuat event baru dengan upload gambar via form-data."""
     
-    name = data.get('name')
-    description = data.get('description')  # opsional
-    event_date_str = data.get('event_date')
-    start_time_str = data.get('start_time')
-    end_time_str = data.get('end_time')
-    table_ids = data.get('table_ids')  # opsional, list table_id yang dipakai event
+    # --- 1. Ambil Data dari Form ---
+    # Memeriksa field wajib dari form
+    if 'name' not in request.form or 'event_date' not in request.form:
+        return jsonify({"error": "Field 'name' dan 'event_date' wajib diisi."}), 400
 
-    # Validasi basic
+    name = request.form.get('name')
+    description = request.form.get('description')
+    event_date_str = request.form.get('event_date')
+    start_time_str = request.form.get('start_time')
+    end_time_str = request.form.get('end_time')
+    table_ids_str = request.form.get('table_ids') # table_ids diterima sebagai string
+
+    # --- 2. Proses Upload Gambar ---
+    image_url = None
+    if 'image' in request.files:
+        image_file = request.files['image']
+        # Pastikan file ada, punya nama, dan ekstensinya diizinkan
+        if image_file and image_file.filename and allowed_file(image_file.filename):
+            filename = secure_filename(image_file.filename)
+            unique_filename = f"{uuid.uuid4().hex}_{filename}"
+            
+            upload_folder = current_app.config.get('UPLOAD_FOLDER')
+            if not upload_folder:
+                 return jsonify({"error": "UPLOAD_FOLDER tidak diatur di konfigurasi."}), 500
+
+            os.makedirs(upload_folder, exist_ok=True)
+            
+            save_path = os.path.join(upload_folder, unique_filename)
+            image_file.save(save_path)
+            
+            # URL yang akan disimpan di database dan dikirim ke client
+            image_url = f"/static/event_images/{unique_filename}"
+            
+    # --- 3. Validasi dan Parsing Data Teks ---
     if not all([name, event_date_str, start_time_str, end_time_str]):
         return jsonify({"error": "Nama, tanggal, jam mulai, dan jam selesai diperlukan"}), 400
 
-    # Parse tanggal
     try:
-        event_date = datetime.strptime(event_date_str, '%Y-%m-%d %H:%M:%S')
+        event_date = datetime.strptime(event_date_str, '%Y-%m-%d')
     except ValueError:
-        return jsonify({"error": "Format tanggal tidak valid. Gunakan 'YYYY-MM-DD HH:MM:SS'"}), 400
+        return jsonify({"error": "Format tanggal tidak valid. Gunakan 'YYYY-MM-DD'"}), 400
 
-    # Parse jam
     try:
         start_time = datetime.strptime(start_time_str, '%H:%M:%S').time()
         end_time = datetime.strptime(end_time_str, '%H:%M:%S').time()
     except ValueError:
         return jsonify({"error": "Format waktu tidak valid. Gunakan 'HH:MM:SS'"}), 400
 
-    # buat event baru
+    table_ids = []
+    if table_ids_str:
+        try:
+            # Mengubah string '[1,2,3]' menjadi list [1, 2, 3]
+            table_ids = json.loads(table_ids_str)
+            if not isinstance(table_ids, list):
+                raise ValueError()
+        except (json.JSONDecodeError, ValueError):
+            return jsonify({"error": "Format table_ids tidak valid. Harus berupa array JSON dalam bentuk string, contoh: '[1, 2, 3]'"}), 400
+
+    # --- 4. Simpan ke Database ---
     new_event = Event(
         name=name,
         description=description,
         event_date=event_date,
         start_time=start_time,
         end_time=end_time,
-        is_active=True  # default aktif
+        is_active=True,
+        image_url=image_url # Menyimpan path gambar
     )
 
     try:
         db.session.add(new_event)
-        db.session.flush()  # supaya new_event.id bisa dipakai
+        db.session.flush() # Diperlukan untuk mendapatkan new_event.id
 
-        # Jika ada table_ids, buat event_table untuk tiap meja
-        if table_ids and isinstance(table_ids, list):
+        # Membuat relasi EventTable jika table_ids diberikan
+        if table_ids:
             for tid in table_ids:
-                event_table = EventTable(
-                    event_id=new_event.id,
-                    table_id=tid,
-                    status=EventTableStatus.AVAILABLE
-                )
-                db.session.add(event_table)
-
+                # Sebaiknya ada validasi apakah table_id (tid) benar-benar ada
+                table = Table.query.get(tid)
+                if table:
+                    event_table = EventTable(
+                        event_id=new_event.id,
+                        table_id=tid,
+                        status=EventTableStatus.AVAILABLE
+                    )
+                    db.session.add(event_table)
+        
         db.session.commit()
         
+        # --- 5. Kirim Response Sukses ---
         return jsonify({
             "message": "Event berhasil dibuat!",
             "event": {
                 "id": new_event.id,
                 "name": new_event.name,
                 "description": new_event.description,
-                "event_date": new_event.event_date.isoformat(),
-                "start_time": str(new_event.start_time),
-                "end_time": str(new_event.end_time),
+                "image_url": new_event.image_url,
+                "event_date": new_event.event_date.strftime('%Y-%m-%d'),
+                "start_time": new_event.start_time.strftime('%H:%M:%S'),
+                "end_time": new_event.end_time.strftime('%H:%M:%S'),
                 "is_active": new_event.is_active,
                 "tables": [
                     {
+                        "event_table_id": et.id,
                         "table_id": et.table_id,
+                        "table_name": et.table.name,
                         "status": et.status.value,
-                        "price": et.table.price  # ambil harga dari table
+                        "price": et.table.price
                     } for et in new_event.event_tables
                 ]
             }
@@ -315,3 +364,52 @@ def update_product(id):
     product.stock = data.get("stock", product.stock)
     db.session.commit()
     return jsonify({"message": "Produk berhasil diperbarui"})
+
+@admin_bp.route("/reservations/<int:reservation_id>/confirm-payment", methods=["POST"])
+@require_api_key
+@jwt_required()
+@require_admin_role
+def confirm_manual_payment(reservation_id):
+    """
+    Endpoint KHUSUS ADMIN untuk mengonfirmasi pembayaran manual 
+    dan men-trigger pembuatan tiket.
+    """
+    reservation = Reservation.query.get(reservation_id)
+    if not reservation:
+        return jsonify({"error": "Reservasi tidak ditemukan."}), 404
+    
+    if reservation.payment_status == PaymentStatus.PAID:
+        return jsonify({"message": "Reservasi ini sudah lunas."}), 400
+
+    try:
+        # 1. Ubah status reservasi
+        reservation.payment_status = PaymentStatus.PAID
+
+        # 2. Buat tiket untuk user (logika yang sebelumnya ada di webhook)
+        event = reservation.event_table.event
+        new_ticket = Ticket(
+            ticket_code=f"TIX-{uuid.uuid4().hex[:10].upper()}",
+            user_id=reservation.user_id,
+            invoice_id=reservation.invoice_id, # invoice_id mungkin null jika tidak dibuat
+            event_id=event.id,
+            expires_at=datetime.combine(event.event_date.date(), event.end_time)
+        )
+        db.session.add(new_ticket)
+        
+        # (Opsional) Kirim email konfirmasi dan e-tiket ke user di sini
+        # Anda bisa memindahkan logika pengiriman email dari webhook Xendit ke sini
+        # current_app.logger.info(f"Mengirim email tiket {new_ticket.ticket_code} ke user {reservation.user.email}")
+        
+        db.session.commit()
+        
+        return jsonify({
+            "message": "Pembayaran berhasil dikonfirmasi!",
+            "reservation_id": reservation.id,
+            "new_status": "PAID",
+            "ticket_code_created": new_ticket.ticket_code
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Gagal konfirmasi pembayaran manual: {e}")
+        return jsonify({"error": "Terjadi kesalahan pada server."}), 500

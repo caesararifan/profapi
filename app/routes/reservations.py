@@ -2,7 +2,8 @@ from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app.models import Reservation, EventTable, EventTableStatus, PaymentStatus, Invoice, Ticket, Event, InvoiceStatus, User, Product, OrderItem
 from app import db
-from xendit import Xendit, XenditError
+# from xendit import Xendit, XenditError
+import urllib.parse
 import uuid
 from datetime import datetime
 
@@ -12,8 +13,8 @@ reservation_bp = Blueprint('reservation', __name__, url_prefix='/reservations')
 @jwt_required()
 def create_reservation():
     """
-    Endpoint for creating a table reservation AND ordering products (OrderItems).
-    This function immediately creates a Xendit invoice and returns the payment URL.
+    Endpoint untuk membuat reservasi meja DAN memesan produk.
+    Fungsi ini sekarang akan menghasilkan URL WhatsApp untuk pembayaran manual.
     """
     data = request.get_json()
     if not data:
@@ -22,10 +23,9 @@ def create_reservation():
     current_user_id = get_jwt_identity()
     user = User.query.get(current_user_id)
     if not user:
-        # This case is unlikely if the JWT is valid, but it's a good safeguard.
         return jsonify({"error": "User not found."}), 404
 
-    # --- 1. INPUT VALIDATION ---
+    # --- 1. VALIDASI INPUT (Tetap sama) ---
     event_table_id = data.get('event_table_id')
     number_of_guests = data.get('number_of_guests')
     arrival_time_str = data.get('arrival_time')
@@ -45,110 +45,116 @@ def create_reservation():
         except (ValueError, TypeError):
             return jsonify({"error": "Invalid format for arrival_time. Use 'HH:MM:SS'."}), 400
 
-    # --- 2. DATABASE VALIDATION AND LOCKING ---
-    # Use with_for_update() to lock the row during the transaction to prevent race conditions (double-booking).
+    # --- 2. VALIDASI DATABASE DAN LOCKING (Tetap sama) ---
     event_table = db.session.query(EventTable).filter_by(id=event_table_id).with_for_update().first()
     
     if not event_table:
         return jsonify({"error": "The selected table for this event does not exist."}), 404
     if event_table.status != EventTableStatus.AVAILABLE:
-        return jsonify({"error": "Sorry, this table is no longer available."}), 409 # 409 Conflict is appropriate here
+        return jsonify({"error": "Sorry, this table is no longer available."}), 409
     if number_of_guests > event_table.table.capacity:
         return jsonify({
             "error": "Number of guests exceeds the table's capacity.",
             "table_capacity": event_table.table.capacity
         }), 400
 
-    # --- 3. TRANSACTIONAL LOGIC ---
+    # --- 3. LOGIKA TRANSAKSI ---
     try:
-        # --- Calculate Total Price ---
+        # Hitung Total Harga (Tetap sama)
         total_amount = event_table.table.price
+        ordered_products_details = [] # --- BARU ---: Untuk detail pesan WA
         
-        # Validate products and calculate subtotal
         for item in order_items_data:
-            if not all(k in item for k in ['product_id', 'quantity']):
-                 raise ValueError("Each item in order_items must have 'product_id' and 'quantity'.")
-            
             product = db.session.query(Product).filter_by(id=item['product_id']).with_for_update().first()
             if not product:
                 raise ValueError(f"Product with ID {item['product_id']} not found.")
             if product.stock < item['quantity']:
                 raise ValueError(f"Not enough stock for '{product.name}'. Available: {product.stock}, Requested: {item['quantity']}.")
             
-            total_amount += product.price * item['quantity']
-        
-        # --- Create Reservation and Order Items ---
+            subtotal = product.price * item['quantity']
+            total_amount += subtotal
+            # --- BARU ---: Simpan detail produk untuk pesan WA
+            ordered_products_details.append(f"- {item['quantity']}x {product.name} (Rp {subtotal:,})")
+
+        # Buat Reservasi & Order Items (Sedikit perubahan)
         event_table.status = EventTableStatus.BOOKED
 
-        # Create the main reservation record
         new_reservation = Reservation(
             user_id=current_user_id,
             event_table_id=event_table_id,
             number_of_guests=number_of_guests,
             total_amount=total_amount,
-            payment_status=PaymentStatus.PENDING,
+            # --- DIUBAH ---: Status diubah menjadi menunggu pembayaran manual
+            payment_status=PaymentStatus.WAITING_MANUAL_PAYMENT, 
             arrival_time=arrival_time
         )
         db.session.add(new_reservation)
-        db.session.flush() # Flush to get the new_reservation.id
+        db.session.flush() # Flush untuk mendapatkan new_reservation.id
 
-        # Create OrderItem records for each product and update stock
         for item in order_items_data:
-            product = db.session.query(Product).get(item['product_id']) # Re-fetch to ensure it's in the session
+            product = db.session.query(Product).get(item['product_id'])
             order_item = OrderItem(
                 reservation_id=new_reservation.id,
                 product_id=item['product_id'],
                 quantity=item['quantity'],
                 subtotal=product.price * item['quantity']
             )
-            product.stock -= item['quantity'] # Decrease product stock
+            product.stock -= item['quantity']
             db.session.add(order_item)
+            
+        # --- LOGIKA PEMBAYARAN DIUBAH TOTAL ---
+        # Hapus semua kode yang berhubungan dengan pembuatan Invoice dan Xendit
+        # Ganti dengan logika membuat link WhatsApp
         
-        # --- Create Invoice and Link to Xendit ---
-        invoice = Invoice(
-            user_id=current_user_id,
-            amount=total_amount,
-            status=InvoiceStatus.PENDING
-        )
-        db.session.add(invoice)
-        db.session.flush() # Flush to get the invoice.id
+        # --- BARU: Buat pesan untuk WhatsApp ---
+        admin_phone_number = current_app.config.get('ADMIN_WHATSAPP_NUMBER')
+        if not admin_phone_number:
+            raise ValueError("Nomor WhatsApp admin belum diatur di konfigurasi.")
 
-        new_reservation.invoice_id = invoice.id
-        external_id = f"invoice-{invoice.id}-{uuid.uuid4().hex[:6]}"
-        invoice.external_id = external_id
+        # Gabungkan detail produk menjadi satu string
+        products_text = "\n".join(ordered_products_details) if ordered_products_details else "Tidak ada."
 
-        # Call Xendit API
-        xendit_instance = Xendit(api_key=current_app.config['XENDIT_API_KEY'])
-        created_invoice = xendit_instance.Invoice.create(
-            external_id=external_id,
-            payer_email=user.email,
-            description=f"Reservation for {event_table.event.name} - Table {event_table.table.name}",
-            amount=total_amount,
-            # You can add more details here if needed
-            # success_redirect_url="your-app://payment-success",
-            # failure_redirect_url="your-app://payment-failure"
-        )
+        # Format pesan
+        message_text = f"""Halo Admin,
+
+Saya ingin menyelesaikan pembayaran untuk reservasi berikut:
+
+*ID Reservasi:* {new_reservation.id}
+*Nama Pemesan:* {user.name}
+*Event:* {event_table.event.name}
+*Meja:* {event_table.table.name}
+*Jumlah Tamu:* {number_of_guests} orang
+
+*Pesanan Tambahan:*
+{products_text}
+
+*Total Pembayaran: Rp {total_amount:,}*
+
+Mohon informasikan langkah selanjutnya untuk transfer. Terima kasih.
+"""
+        # URL Encode pesan agar aman digunakan di URL
+        encoded_message = urllib.parse.quote(message_text)
         
-        invoice.invoice_url = created_invoice.invoice_url
-        db.session.commit() # Commit the entire transaction
+        # Buat URL WhatsApp
+        whatsapp_url = f"https://wa.me/{admin_phone_number}?text={encoded_message}"
+        
+        # Commit transaksi ke database
+        db.session.commit()
 
+        # --- DIUBAH ---: Kembalikan URL WhatsApp, bukan URL invoice
         return jsonify({
-            "message": "Reservation created successfully! Please proceed to payment.",
-            "invoice_url": created_invoice.invoice_url
+            "message": "Reservasi berhasil dicatat. Silakan hubungi admin via WhatsApp untuk menyelesaikan pembayaran.",
+            "reservation_id": new_reservation.id,
+            "whatsapp_url": whatsapp_url
         }), 201
 
     except ValueError as ve:
         db.session.rollback()
         return jsonify({"error": str(ve)}), 400
-    except XenditError as xe:
-        db.session.rollback()
-        current_app.logger.error(f"Xendit API Error: {xe}")
-        return jsonify({"error": "Failed to create payment invoice.", "details": str(xe)}), 502 # Bad Gateway
     except Exception as e:
         db.session.rollback()
-        current_app.logger.error(f"An unexpected error occurred during reservation: {e}")
-        return jsonify({"error": "An internal server error occurred."}), 500
-
+        current_app.logger.error(f"Error saat reservasi manual: {e}")
+        return jsonify({"error": "Terjadi kesalahan internal server."}), 500
 
 @reservation_bp.route("/my-reservations", methods=["GET"])
 @jwt_required()
