@@ -1,6 +1,8 @@
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required
-from app.models import Event,EventTable, EventTableStatus, Table, Product, PaymentStatus, Ticket, Reservation
+from app.models import(Event,EventTable, EventTableStatus, 
+                       Table, Product, PaymentStatus, 
+                       Ticket, Reservation, User)
 import uuid
 from app import db
 from app import db
@@ -10,7 +12,6 @@ import os
 import json
 from werkzeug.utils import secure_filename
 
-# Membuat Blueprint baru untuk admin
 admin_bp = Blueprint('admin', __name__, url_prefix='/admin')
 
 @admin_bp.route("/")
@@ -28,87 +29,93 @@ def allowed_file(filename):
 @jwt_required()
 @require_admin_role
 def create_event():
-    """Endpoint untuk admin membuat event baru dengan upload gambar via form-data."""
-    
-    # --- 1. Ambil Data dari Form ---
-    # Memeriksa field wajib dari form
+    """
+    Endpoint untuk admin membuat event baru dengan upload gambar via form-data.
+    Termasuk validasi untuk mencegah meja yang sama digunakan di banyak event.
+    """
+    # --- 1. Validasi Input Form ---
     if 'name' not in request.form or 'event_date' not in request.form:
         return jsonify({"error": "Field 'name' dan 'event_date' wajib diisi."}), 400
 
+    # --- 2. Ambil dan Proses Data ---
     name = request.form.get('name')
     description = request.form.get('description')
     event_date_str = request.form.get('event_date')
     start_time_str = request.form.get('start_time')
     end_time_str = request.form.get('end_time')
-    table_ids_str = request.form.get('table_ids') # table_ids diterima sebagai string
+    table_ids_str = request.form.get('table_ids')
 
-    # --- 2. Proses Upload Gambar ---
-    image_url = None
-    if 'image' in request.files:
-        image_file = request.files['image']
-        # Pastikan file ada, punya nama, dan ekstensinya diizinkan
-        if image_file and image_file.filename and allowed_file(image_file.filename):
-            filename = secure_filename(image_file.filename)
-            unique_filename = f"{uuid.uuid4().hex}_{filename}"
-            
-            upload_folder = current_app.config.get('UPLOAD_FOLDER')
-            if not upload_folder:
-                 return jsonify({"error": "UPLOAD_FOLDER tidak diatur di konfigurasi."}), 500
-
-            os.makedirs(upload_folder, exist_ok=True)
-            
-            save_path = os.path.join(upload_folder, unique_filename)
-            image_file.save(save_path)
-            
-            # URL yang akan disimpan di database dan dikirim ke client
-            image_url = f"/static/event_images/{unique_filename}"
-            
-    # --- 3. Validasi dan Parsing Data Teks ---
-    if not all([name, event_date_str, start_time_str, end_time_str]):
-        return jsonify({"error": "Nama, tanggal, jam mulai, dan jam selesai diperlukan"}), 400
-
+    # Proses parsing tanggal dan waktu
     try:
         event_date = datetime.strptime(event_date_str, '%Y-%m-%d')
-    except ValueError:
-        return jsonify({"error": "Format tanggal tidak valid. Gunakan 'YYYY-MM-DD'"}), 400
-
-    try:
         start_time = datetime.strptime(start_time_str, '%H:%M:%S').time()
         end_time = datetime.strptime(end_time_str, '%H:%M:%S').time()
-    except ValueError:
-        return jsonify({"error": "Format waktu tidak valid. Gunakan 'HH:MM:SS'"}), 400
+    except (ValueError, TypeError):
+        return jsonify({"error": "Format tanggal atau waktu tidak valid. Gunakan 'YYYY-MM-DD' dan 'HH:MM:SS'."}), 400
 
+    # Proses parsing table_ids
     table_ids = []
     if table_ids_str:
         try:
-            # Mengubah string '[1,2,3]' menjadi list [1, 2, 3]
             table_ids = json.loads(table_ids_str)
-            if not isinstance(table_ids, list):
-                raise ValueError()
+            if not isinstance(table_ids, list): raise ValueError()
         except (json.JSONDecodeError, ValueError):
             return jsonify({"error": "Format table_ids tidak valid. Harus berupa array JSON dalam bentuk string, contoh: '[1, 2, 3]'"}), 400
 
-    # --- 4. Simpan ke Database ---
-    new_event = Event(
-        name=name,
-        description=description,
-        event_date=event_date,
-        start_time=start_time,
-        end_time=end_time,
-        is_active=True,
-        image_url=image_url # Menyimpan path gambar
-    )
+    # --- 3. Proses Upload Gambar (Opsional) ---
+    image_url = None
+    if 'image' in request.files and request.files['image'].filename != '':
+        image_file = request.files['image']
+        if allowed_file(image_file.filename):
+            filename = secure_filename(image_file.filename)
+            unique_filename = f"{uuid.uuid4().hex}_{filename}"
+            upload_folder = current_app.config['UPLOAD_FOLDERS'].get('events')
+            
+            if not upload_folder:
+                return jsonify({"error": "Konfigurasi folder upload untuk event tidak diatur."}), 500
+            
+            save_path = os.path.join(upload_folder, unique_filename)
+            try:
+                os.makedirs(upload_folder, exist_ok=True)
+                image_file.save(save_path)
+                image_url = f"/static/event_images/{unique_filename}"
+            except Exception as e:
+                current_app.logger.error(f"Gagal menyimpan file gambar event: {e}")
+                return jsonify({"error": f"Tidak dapat menyimpan file di server: {e}"}), 500
+        else:
+            return jsonify({"error": "Tipe file gambar tidak diizinkan."}), 400
 
+    # --- 4. Simpan ke Database dengan Transaksi ---
     try:
+        # Buat objek Event
+        new_event = Event(
+            name=name,
+            description=description,
+            event_date=event_date,
+            start_time=start_time,
+            end_time=end_time,
+            is_active=True,
+            image_url=image_url
+        )
         db.session.add(new_event)
-        db.session.flush() # Diperlukan untuk mendapatkan new_event.id
+        db.session.flush()  # Diperlukan untuk mendapatkan new_event.id
 
-        # Membuat relasi EventTable jika table_ids diberikan
+        # Tautkan meja jika ada
         if table_ids:
             for tid in table_ids:
-                # Sebaiknya ada validasi apakah table_id (tid) benar-benar ada
                 table = Table.query.get(tid)
                 if table:
+                    # VALIDASI KUNCI: Cek apakah meja sudah terhubung ke event lain
+                    existing_link = EventTable.query.filter_by(table_id=tid).first()
+                    if existing_link:
+                        # Jika sudah ada, batalkan seluruh transaksi dan kirim error
+                        db.session.rollback()
+                        return jsonify({
+                            "error": "Conflict: Table already assigned.",
+                            "message": f"Meja '{table.name}' (ID: {tid}) sudah digunakan di event lain dan tidak bisa ditambahkan."
+                        }), 409  # 409 Conflict adalah status yang tepat
+
+                    # Jika aman, buat hubungan baru
                     event_table = EventTable(
                         event_id=new_event.id,
                         table_id=tid,
@@ -116,34 +123,37 @@ def create_event():
                     )
                     db.session.add(event_table)
         
+        # Jika semua validasi berhasil, simpan permanen
         db.session.commit()
         
-        # --- 5. Kirim Response Sukses ---
+        # --- 5. Siapkan dan Kirim Respons Sukses ---
+        event_data = {
+            "id": new_event.id,
+            "name": new_event.name,
+            "description": new_event.description,
+            "image_url": new_event.image_url,
+            "event_date": new_event.event_date.strftime('%Y-%m-%d'),
+            "start_time": new_event.start_time.strftime('%H:%M:%S'),
+            "end_time": new_event.end_time.strftime('%H:%M:%S'),
+            "is_active": new_event.is_active,
+            "tables": [
+                {
+                    "event_table_id": et.id,
+                    "table_id": et.table_id,
+                    "table_name": et.table.name,
+                    "status": et.status.value,
+                    "price": et.table.price
+                } for et in new_event.event_tables
+            ]
+        }
         return jsonify({
             "message": "Event berhasil dibuat!",
-            "event": {
-                "id": new_event.id,
-                "name": new_event.name,
-                "description": new_event.description,
-                "image_url": new_event.image_url,
-                "event_date": new_event.event_date.strftime('%Y-%m-%d'),
-                "start_time": new_event.start_time.strftime('%H:%M:%S'),
-                "end_time": new_event.end_time.strftime('%H:%M:%S'),
-                "is_active": new_event.is_active,
-                "tables": [
-                    {
-                        "event_table_id": et.id,
-                        "table_id": et.table_id,
-                        "table_name": et.table.name,
-                        "status": et.status.value,
-                        "price": et.table.price
-                    } for et in new_event.event_tables
-                ]
-            }
+            "event": event_data
         }), 201
+
     except Exception as e:
         db.session.rollback()
-        current_app.logger.error(f"Gagal membuat event: {e}")
+        current_app.logger.error(f"Gagal total saat membuat event: {e}")
         return jsonify({"error": "Terjadi kesalahan pada server saat menyimpan event."}), 500
 
 @admin_bp.route("/events/<int:id>", methods=["GET"])
@@ -320,23 +330,89 @@ def get_all_events():
 @jwt_required()
 @require_admin_role
 def create_product():
-    """Endpoint untuk admin membuat produk baru."""
-    data = request.get_json()
-    if not all(k in data for k in ["name", "price", "stock"]):
+    """Endpoint untuk admin membuat produk baru dengan upload gambar."""
+    current_app.logger.info("--- Endpoint /products [POST] dipanggil ---")
+    
+    # 1. Validasi Input Dasar
+    if 'name' not in request.form or 'price' not in request.form or 'stock' not in request.form:
+        current_app.logger.warning("Request GAGAL: Field wajib (name, price, stock) tidak ada.")
         return jsonify({"error": "Field name, price, dan stock wajib ada"}), 400
 
-    new_product = Product(
-        name=data["name"],
-        description=data.get("description"),
-        price=data["price"],
-        stock=data["stock"]
-    )
-    db.session.add(new_product)
-    db.session.commit()
-    return jsonify({
-        "message": "Produk berhasil ditambahkan",
-        "product": {"id": new_product.id, "name": new_product.name, "price": new_product.price}
-    }), 201
+    # 2. Ambil Data dari Form
+    name = request.form.get('name')
+    description = request.form.get('description')
+    price_str = request.form.get('price')
+    stock_str = request.form.get('stock')
+    current_app.logger.info(f"Data Form Diterima: name='{name}', price='{price_str}', stock='{stock_str}'")
+
+    # Validasi tipe data untuk price dan stock
+    try:
+        price = int(price_str)
+        stock = int(stock_str)
+    except (ValueError, TypeError):
+        current_app.logger.warning("Request GAGAL: Price atau Stock bukan angka yang valid.")
+        return jsonify({"error": "Price dan Stock harus berupa angka."}), 400
+
+    # 3. Proses Upload Gambar
+    image_url = None
+    if 'image' in request.files and request.files['image'].filename != '':
+        image_file = request.files['image']
+        current_app.logger.info(f"File diterima: {image_file.filename}")
+        
+        if allowed_file(image_file.filename):
+            filename = secure_filename(image_file.filename)
+            unique_filename = f"{uuid.uuid4().hex}_{filename}"
+            upload_folder = current_app.config['UPLOAD_FOLDERS'].get('products')
+
+            if not upload_folder:
+                current_app.logger.error("FATAL: Konfigurasi 'products' di UPLOAD_FOLDERS tidak ditemukan!")
+                return jsonify({"error": "Konfigurasi upload folder server bermasalah."}), 500
+
+            save_path = os.path.join(upload_folder, unique_filename)
+            current_app.logger.info(f"Mencoba menyimpan file ke: {save_path}")
+
+            try:
+                os.makedirs(upload_folder, exist_ok=True)
+                image_file.save(save_path) # Poin kritis
+                image_url = f"/static/product_images/{unique_filename}"
+                current_app.logger.info("File berhasil disimpan.")
+            except Exception as e:
+                current_app.logger.error(f"GAGAL MENYIMPAN FILE! Error: {e}")
+                return jsonify({"error": f"Tidak dapat menyimpan file di server. Detail: {e}"}), 500
+        else:
+            current_app.logger.warning("Upload GAGAL: Tipe file tidak diizinkan.")
+            return jsonify({"error": "Tipe file tidak diizinkan."}), 400
+    else:
+        current_app.logger.info("Tidak ada file gambar yang diunggah, melanjutkan tanpa gambar.")
+
+    # 4. Simpan ke Database
+    try:
+        current_app.logger.info("Mencoba menyimpan data produk ke database...")
+        new_product = Product(
+            name=name,
+            description=description,
+            price=price,
+            stock=stock,
+            image_url=image_url
+        )
+        db.session.add(new_product)
+        db.session.commit()
+        current_app.logger.info(f"Produk '{name}' berhasil disimpan dengan ID: {new_product.id}")
+
+        return jsonify({
+            "message": "Produk berhasil ditambahkan",
+            "product": {
+                "id": new_product.id,
+                "name": new_product.name,
+                "price": new_product.price,
+                "stock": new_product.stock,
+                "image_url": new_product.image_url
+            }
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"GAGAL COMMIT KE DATABASE! Error: {e}")
+        return jsonify({"error": "Terjadi kesalahan pada database server."}), 500
 
 @admin_bp.route("/products", methods=["GET"])
 @require_api_key
@@ -346,7 +422,14 @@ def get_all_products_admin():
     """Endpoint untuk admin melihat semua produk."""
     products = Product.query.all()
     return jsonify([
-        {"id": p.id, "name": p.name, "description": p.description, "price": p.price, "stock": p.stock}
+        {
+            "id": p.id, 
+            "name": p.name, 
+            "description": p.description, 
+            "price": p.price, 
+            "stock": p.stock,
+            "image_url": p.image_url # Menambahkan image_url di sini
+        }
         for p in products
     ])
 
@@ -374,9 +457,7 @@ def confirm_manual_payment(reservation_id):
     Endpoint KHUSUS ADMIN untuk mengonfirmasi pembayaran manual 
     dan men-trigger pembuatan tiket.
     """
-    reservation = Reservation.query.get(reservation_id)
-    if not reservation:
-        return jsonify({"error": "Reservasi tidak ditemukan."}), 404
+    reservation = Reservation.query.get_or_404(reservation_id)
     
     if reservation.payment_status == PaymentStatus.PAID:
         return jsonify({"message": "Reservasi ini sudah lunas."}), 400
@@ -385,20 +466,20 @@ def confirm_manual_payment(reservation_id):
         # 1. Ubah status reservasi
         reservation.payment_status = PaymentStatus.PAID
 
-        # 2. Buat tiket untuk user (logika yang sebelumnya ada di webhook)
+        # 2. Buat tiket untuk user
         event = reservation.event_table.event
         new_ticket = Ticket(
             ticket_code=f"TIX-{uuid.uuid4().hex[:10].upper()}",
             user_id=reservation.user_id,
-            invoice_id=reservation.invoice_id, # invoice_id mungkin null jika tidak dibuat
+            # Menggunakan getattr untuk keamanan jika invoice_id tidak ada
+            invoice_id=getattr(reservation, 'invoice_id', None),
             event_id=event.id,
-            expires_at=datetime.combine(event.event_date.date(), event.end_time)
+            # --- PERBAIKAN DI SINI ---
+            expires_at=datetime.combine(event.event_date, event.end_time)
         )
         db.session.add(new_ticket)
         
-        # (Opsional) Kirim email konfirmasi dan e-tiket ke user di sini
-        # Anda bisa memindahkan logika pengiriman email dari webhook Xendit ke sini
-        # current_app.logger.info(f"Mengirim email tiket {new_ticket.ticket_code} ke user {reservation.user.email}")
+        # Opsi untuk mengirim email notifikasi tiket bisa ditambahkan di sini
         
         db.session.commit()
         
@@ -413,3 +494,184 @@ def confirm_manual_payment(reservation_id):
         db.session.rollback()
         current_app.logger.error(f"Gagal konfirmasi pembayaran manual: {e}")
         return jsonify({"error": "Terjadi kesalahan pada server."}), 500
+    
+@admin_bp.route("/products/<int:id>", methods=["GET"])
+@require_api_key
+@jwt_required()
+@require_admin_role
+def get_product(id):
+    """Endpoint untuk admin melihat detail satu produk berdasarkan ID."""
+    product = Product.query.get_or_404(id)
+    
+    return jsonify({
+        "id": product.id, 
+        "name": product.name, 
+        "description": product.description, 
+        "price": product.price, 
+        "stock": product.stock,
+        "image_url": product.image_url
+    })
+
+# DELETE untuk Product
+@admin_bp.route("/products/<int:id>", methods=["DELETE"])
+@require_api_key
+@jwt_required()
+@require_admin_role
+def delete_product(id):
+    """Endpoint untuk admin menghapus produk."""
+    product = Product.query.get_or_404(id)
+    
+    if product.image_url:
+        try:
+            image_path = os.path.join(current_app.config['UPLOAD_FOLDERS']['products'], os.path.basename(product.image_url))
+            if os.path.exists(image_path):
+                os.remove(image_path)
+        except Exception as e:
+            current_app.logger.error(f"Gagal menghapus file gambar: {e}")
+
+    db.session.delete(product)
+    db.session.commit()
+    return jsonify({"message": f"Produk '{product.name}' berhasil dihapus"})
+
+# UPDATE untuk Event
+@admin_bp.route("/events/<int:id>", methods=["PUT"])
+@require_api_key
+@jwt_required()
+@require_admin_role
+def update_event(id):
+    """Endpoint untuk admin memperbarui detail event."""
+    event = Event.query.get_or_404(id)
+    data = request.get_json()
+
+    # Update atribut dasar event
+    event.name = data.get('name', event.name)
+    event.description = data.get('description', event.description)
+    event.is_active = data.get('is_active', event.is_active)
+
+    # Update tanggal dan waktu jika ada
+    if 'event_date' in data:
+        event.event_date = datetime.strptime(data['event_date'], '%Y-%m-%d')
+    if 'start_time' in data:
+        event.start_time = datetime.strptime(data['start_time'], '%H:%M:%S').time()
+    if 'end_time' in data:
+        event.end_time = datetime.strptime(data['end_time'], '%H:%M:%S').time()
+
+    # Update relasi meja (logika yang lebih kompleks)
+    if 'table_ids' in data:
+        new_table_ids = set(data['table_ids'])
+        
+        # Hapus relasi yang tidak ada lagi
+        for event_table in list(event.event_tables):
+            if event_table.table_id not in new_table_ids:
+                db.session.delete(event_table)
+        
+        # Tambah relasi baru
+        current_table_ids = {et.table_id for et in event.event_tables}
+        for table_id in new_table_ids:
+            if table_id not in current_table_ids:
+                table = Table.query.get(table_id)
+                if table:
+                    new_event_table = EventTable(
+                        event_id=event.id,
+                        table_id=table_id,
+                        status=EventTableStatus.AVAILABLE
+                    )
+                    db.session.add(new_event_table)
+
+    db.session.commit()
+    return jsonify({"message": f"Event '{event.name}' berhasil diperbarui"})
+
+# DELETE untuk Event
+@admin_bp.route("/events/<int:id>", methods=["DELETE"])
+@require_api_key
+@jwt_required()
+@require_admin_role
+def delete_event(id):
+    """Endpoint untuk admin menghapus event."""
+    event = Event.query.get_or_404(id)
+    
+    db.session.delete(event)
+    db.session.commit()
+    return jsonify({"message": f"Event '{event.name}' berhasil dihapus"})
+
+@admin_bp.route("/tables/available", methods=["GET"])
+@require_api_key
+@jwt_required()
+@require_admin_role
+def get_available_tables():
+    """
+    Endpoint untuk admin melihat daftar meja yang BELUM terikat
+    ke event manapun.
+    """
+    try:
+        # 1. Ambil semua ID meja yang sudah terikat di tabel EventTable
+        used_table_ids_query = db.session.query(EventTable.table_id).distinct()
+        used_table_ids = [id[0] for id in used_table_ids_query.all()]
+
+        # 2. Ambil semua meja yang ID-nya TIDAK ADA dalam daftar ID yang sudah terikat
+        available_tables = Table.query.filter(Table.id.notin_(used_table_ids)).all()
+
+        # 3. Format respons JSON
+        return jsonify([
+            {
+                "id": t.id,
+                "name": t.name,
+                "type": t.type,
+                "capacity": t.capacity,
+                "price": t.price
+            } for t in available_tables
+        ])
+
+    except Exception as e:
+        current_app.logger.error(f"Gagal mengambil meja yang tersedia: {e}")
+        return jsonify({"error": "Terjadi kesalahan pada server."}), 500
+    
+@admin_bp.route("/users/<string:user_id>/reservations", methods=["DELETE"])
+@require_api_key
+@jwt_required()
+@require_admin_role
+def delete_all_user_reservations(user_id):
+    """
+    Endpoint ADMIN ONLY untuk menghapus SEMUA reservasi milik seorang pengguna.
+    OPERASI INI BERSIFAT DESTRUKTIF DAN PERMANEN.
+    """
+    # 1. Pastikan pengguna ada
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({"error": "Pengguna tidak ditemukan."}), 404
+
+    # 2. Ambil semua reservasi milik pengguna tersebut
+    reservations_to_delete = Reservation.query.filter_by(user_id=user_id).all()
+
+    if not reservations_to_delete:
+        return jsonify({"message": f"Tidak ada reservasi yang ditemukan untuk pengguna '{user.name}'."}), 200
+
+    try:
+        # 3. Lakukan proses penghapusan untuk setiap reservasi
+        for reservation in reservations_to_delete:
+            # Kembalikan stok produk yang dipesan
+            for item in reservation.order_items:
+                item.product.stock += item.quantity
+            
+            # Ubah status meja kembali menjadi AVAILABLE (jika belum lewat)
+            if reservation.event_table.event.event_date >= datetime.utcnow().date():
+                 reservation.event_table.status = EventTableStatus.AVAILABLE
+
+            # Hapus tiket yang terhubung (jika ada)
+            Ticket.query.filter_by(reservation_id=reservation.id).delete()
+
+            # Hapus reservasi itu sendiri
+            # (Penghapusan OrderItem akan otomatis jika cascade diatur di model)
+            db.session.delete(reservation)
+
+        # 4. Commit semua perubahan ke database
+        db.session.commit()
+        
+        return jsonify({
+            "message": f"Berhasil menghapus {len(reservations_to_delete)} reservasi milik pengguna '{user.name}'."
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Gagal menghapus semua reservasi untuk user {user_id}: {e}")
+        return jsonify({"error": "Terjadi kesalahan pada server saat proses penghapusan."}), 500

@@ -87,6 +87,7 @@ class Product(db.Model):
     description = db.Column(db.Text, nullable=True)
     price = db.Column(db.Integer, nullable=False) # Harga produk (dalam integer)
     stock = db.Column(db.Integer, default=0, nullable=False)
+    image_url = db.Column(db.String(255), nullable=True)
 
     def __repr__(self):
         return f"<Product {self.name} - {self.price}>"
@@ -145,7 +146,7 @@ class Ticket(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     ticket_code = db.Column(db.String(32), unique=True, nullable=False)
     user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)
-    invoice_id = db.Column(db.String(36), db.ForeignKey('invoices.id'), nullable=False)
+    invoice_id = db.Column(db.String(36), db.ForeignKey('invoices.id'), nullable=True)
     event_id = db.Column(db.Integer, db.ForeignKey('events.id'), nullable=False)
     expires_at = db.Column(db.DateTime, nullable=False)
     is_used = db.Column(db.Boolean, default=False, nullable=False)

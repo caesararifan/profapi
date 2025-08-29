@@ -1,8 +1,10 @@
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from app.models import Reservation, EventTable, EventTableStatus, PaymentStatus, Invoice, Ticket, Event, InvoiceStatus, User, Product, OrderItem
+from app.models import (
+    Reservation, EventTable, EventTableStatus, PaymentStatus, 
+    Ticket, Event, User, Product, OrderItem
+)
 from app import db
-# from xendit import Xendit, XenditError
 import urllib.parse
 import uuid
 from datetime import datetime
@@ -25,7 +27,7 @@ def create_reservation():
     if not user:
         return jsonify({"error": "User not found."}), 404
 
-    # --- 1. VALIDASI INPUT (Tetap sama) ---
+    # --- 1. VALIDASI INPUT ---
     event_table_id = data.get('event_table_id')
     number_of_guests = data.get('number_of_guests')
     arrival_time_str = data.get('arrival_time')
@@ -45,7 +47,7 @@ def create_reservation():
         except (ValueError, TypeError):
             return jsonify({"error": "Invalid format for arrival_time. Use 'HH:MM:SS'."}), 400
 
-    # --- 2. VALIDASI DATABASE DAN LOCKING (Tetap sama) ---
+    # --- 2. VALIDASI DATABASE DAN LOCKING ---
     event_table = db.session.query(EventTable).filter_by(id=event_table_id).with_for_update().first()
     
     if not event_table:
@@ -60,9 +62,8 @@ def create_reservation():
 
     # --- 3. LOGIKA TRANSAKSI ---
     try:
-        # Hitung Total Harga (Tetap sama)
         total_amount = event_table.table.price
-        ordered_products_details = [] # --- BARU ---: Untuk detail pesan WA
+        ordered_products_details = []
         
         for item in order_items_data:
             product = db.session.query(Product).filter_by(id=item['product_id']).with_for_update().first()
@@ -73,10 +74,8 @@ def create_reservation():
             
             subtotal = product.price * item['quantity']
             total_amount += subtotal
-            # --- BARU ---: Simpan detail produk untuk pesan WA
             ordered_products_details.append(f"- {item['quantity']}x {product.name} (Rp {subtotal:,})")
 
-        # Buat Reservasi & Order Items (Sedikit perubahan)
         event_table.status = EventTableStatus.BOOKED
 
         new_reservation = Reservation(
@@ -84,12 +83,11 @@ def create_reservation():
             event_table_id=event_table_id,
             number_of_guests=number_of_guests,
             total_amount=total_amount,
-            # --- DIUBAH ---: Status diubah menjadi menunggu pembayaran manual
             payment_status=PaymentStatus.WAITING_MANUAL_PAYMENT, 
             arrival_time=arrival_time
         )
         db.session.add(new_reservation)
-        db.session.flush() # Flush untuk mendapatkan new_reservation.id
+        db.session.flush()
 
         for item in order_items_data:
             product = db.session.query(Product).get(item['product_id'])
@@ -102,46 +100,19 @@ def create_reservation():
             product.stock -= item['quantity']
             db.session.add(order_item)
             
-        # --- LOGIKA PEMBAYARAN DIUBAH TOTAL ---
-        # Hapus semua kode yang berhubungan dengan pembuatan Invoice dan Xendit
-        # Ganti dengan logika membuat link WhatsApp
-        
-        # --- BARU: Buat pesan untuk WhatsApp ---
+        # --- LOGIKA PEMBAYARAN MANUAL VIA WHATSAPP ---
         admin_phone_number = current_app.config.get('ADMIN_WHATSAPP_NUMBER')
         if not admin_phone_number:
             raise ValueError("Nomor WhatsApp admin belum diatur di konfigurasi.")
 
-        # Gabungkan detail produk menjadi satu string
         products_text = "\n".join(ordered_products_details) if ordered_products_details else "Tidak ada."
 
-        # Format pesan
-        message_text = f"""Halo Admin,
-
-Saya ingin menyelesaikan pembayaran untuk reservasi berikut:
-
-*ID Reservasi:* {new_reservation.id}
-*Nama Pemesan:* {user.name}
-*Event:* {event_table.event.name}
-*Meja:* {event_table.table.name}
-*Jumlah Tamu:* {number_of_guests} orang
-
-*Pesanan Tambahan:*
-{products_text}
-
-*Total Pembayaran: Rp {total_amount:,}*
-
-Mohon informasikan langkah selanjutnya untuk transfer. Terima kasih.
-"""
-        # URL Encode pesan agar aman digunakan di URL
+        message_text = f"""Halo Admin,\n\nSaya ingin menyelesaikan pembayaran untuk reservasi berikut:\n\n*ID Reservasi:* {new_reservation.id}\n*Nama Pemesan:* {user.name}\n*Event:* {event_table.event.name}\n*Meja:* {event_table.table.name}\n*Jumlah Tamu:* {number_of_guests} orang\n\n*Pesanan Tambahan:*\n{products_text}\n\n*Total Pembayaran: Rp {total_amount:,}*\n\nMohon informasikan langkah selanjutnya untuk transfer. Terima kasih."""
         encoded_message = urllib.parse.quote(message_text)
-        
-        # Buat URL WhatsApp
         whatsapp_url = f"https://wa.me/{admin_phone_number}?text={encoded_message}"
         
-        # Commit transaksi ke database
         db.session.commit()
 
-        # --- DIUBAH ---: Kembalikan URL WhatsApp, bukan URL invoice
         return jsonify({
             "message": "Reservasi berhasil dicatat. Silakan hubungi admin via WhatsApp untuk menyelesaikan pembayaran.",
             "reservation_id": new_reservation.id,
@@ -165,7 +136,7 @@ def get_my_reservations():
     reservations = Reservation.query.filter_by(user_id=current_user_id).order_by(Reservation.created_at.desc()).all()
     
     if not reservations:
-        return jsonify({"message": "Anda belum memiliki reservasi."}), 200
+        return jsonify([]), 200 # Kembalikan list kosong jika tidak ada
 
     results = []
     for res in reservations:
@@ -182,58 +153,13 @@ def get_my_reservations():
         
     return jsonify(results)
 
-@reservation_bp.route("/xendit-webhook", methods=["POST"])
-def xendit_webhook():
-    # ... (Verifikasi callback token tetap sama) ...
-    data = request.get_json()
-    external_id = data.get('external_id')
-    status = data.get('status')
-
-    invoice = Invoice.query.filter_by(external_id=external_id).first()
-    if not invoice:
-        return jsonify({"message": "Invoice tidak ditemukan"}), 404
-
-    # Ambil reservasi yang terhubung
-    reservation = Reservation.query.filter_by(invoice_id=invoice.id).first()
-
-    if status == 'PAID':
-        invoice.status = InvoiceStatus.PAID
-        if reservation:
-            reservation.payment_status = PaymentStatus.PAID
-            
-            # [LOGIKA BARU] Buat tiket setelah pembayaran lunas
-            event = reservation.event_table.event
-            new_ticket = Ticket(
-                ticket_code=f"TIX-{uuid.uuid4().hex[:10].upper()}",
-                user_id=reservation.user_id,
-                invoice_id=invoice.id,
-                event_id=event.id,
-                expires_at=datetime.combine(event.event_date, event.end_time)
-            )
-            db.session.add(new_ticket)
-            print(f"Tiket {new_ticket.ticket_code} dibuat untuk invoice {invoice.id}")
-
-    elif status == 'EXPIRED':
-        invoice.status = InvoiceStatus.EXPIRED
-        if reservation:
-            reservation.payment_status = PaymentStatus.EXPIRED
-            event_table = EventTable.query.get(reservation.event_table_id)
-            if event_table:
-                event_table.status = EventTableStatus.AVAILABLE
-                # Kembalikan stok produk
-                for item in reservation.order_items:
-                    item.product.stock += item.quantity
-    
-    db.session.commit()
-    return jsonify({"status": "ok"}), 200
-
 @reservation_bp.route("/my-tickets", methods=["GET"])
 @jwt_required()
 def get_my_tickets():
     """Endpoint untuk user melihat daftar tiket aktif miliknya."""
     current_user_id = get_jwt_identity()
     
-    # Ambil tiket yang invoice-nya sudah lunas dan event-nya belum berakhir
+    # Ambil tiket yang belum dipakai dan event-nya belum/sedang berlangsung
     active_tickets = Ticket.query.join(Ticket.event).filter(
         Ticket.user_id == current_user_id,
         Ticket.is_used == False,
@@ -246,6 +172,5 @@ def get_my_tickets():
             "event_name": t.event.name,
             "event_date": t.event.event_date.isoformat(),
             "is_used": t.is_used
-            # Anda juga bisa menambahkan detail reservasi jika perlu
         } for t in active_tickets
     ])

@@ -1,159 +1,22 @@
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required
 from datetime import datetime
-import uuid
-from xendit import Xendit, XenditError
-from ..models import User, Invoice, Event, Ticket, Table
+# import uuid
+from ..models import User, Invoice, Event, Ticket, Table, Product
 from .. import db
 from ..utils import require_api_key
 
 # Membuat Blueprint baru untuk user
 user_bp = Blueprint('user', __name__)
 
-def create_xendit_invoice(amount, description, payer_email):
-    """Fungsi bantuan untuk membuat invoice di Xendit menggunakan SDK."""
-    try:
-        xendit_instance = Xendit(api_key=current_app.config['XENDIT_API_KEY'])
-        external_id = f"invoice-flask-{uuid.uuid4()}"
-        
-        created_invoice = xendit_instance.Invoice.create(
-            external_id=external_id,
-            payer_email=payer_email,
-            description=description,
-            amount=amount
-        )
-        return created_invoice, None
-    except XenditError as e:
-        return None, f"Error dari Xendit: {e.error_code}"
-    except Exception as e:
-        return None, f"Terjadi kesalahan tak terduga: {e}"
+# FUNGSI DAN ROUTE XENDIT DIHAPUS DARI SINI
 
-@user_bp.route("/create-invoice", methods=["POST"])
-@require_api_key
-@jwt_required()
-def handle_create_invoice():
-    """Membuat invoice Xendit dan menyimpannya ke database."""
-    data = request.get_json()
-    amount_from_request = data.get('amount')
-    user_id = data.get('user_id')
-    event_id = data.get('event_id')
-
-    if not all([amount_from_request, user_id, event_id]):
-        return jsonify({"error": "Jumlah (amount), user_id, dan event_id diperlukan"}), 400
-    
-    user = User.query.get(user_id)
-    if not user:
-        return jsonify({"error": "User tidak ditemukan"}), 404
-    
-    event = Event.query.get(event_id)
-    if not event:
-        return jsonify({"error": "Event tidak ditemukan"}), 404
-
-    correct_price = event.price
-    if amount_from_request < correct_price:
-        return jsonify({
-            "error": "Jumlah pembayaran tidak sesuai.",
-            "harga_seharusnya": correct_price,
-            "harga_dikirim": amount_from_request
-        }), 400
-
-    invoice_object, error = create_xendit_invoice(
-        correct_price,
-        data.get('description', f'Tiket untuk {event.name} oleh {user.name}'), 
-        user.email
-    )
-    
-    if error:
-        return jsonify({"error": "Gagal membuat invoice", "details": error}), 500
-    
-    new_invoice = Invoice(
-        external_id=invoice_object.external_id,
-        user_id=user.id,
-        event_id=event.id, 
-        amount=correct_price,
-        status=invoice_object.status,
-        invoice_url=invoice_object.invoice_url
-    )
-    db.session.add(new_invoice)
-    db.session.commit()
-    
-    return jsonify({
-        "message": "Invoice berhasil dibuat dan dicatat!",
-        "invoice_url": invoice_object.invoice_url
-    })
-
-@user_bp.route("/create-virtual-account", methods=["POST"])
-@require_api_key
-@jwt_required()
-def handle_create_va():
-    """Membuat Virtual Account secara spesifik dan mengembalikan nomornya."""
-    data = request.get_json()
-    user_id = data.get('user_id')
-    event_id = data.get('event_id')
-    bank_code = data.get('bank_code')
-
-    if not all([user_id, event_id, bank_code]):
-        return jsonify({"error": "user_id, event_id, dan bank_code diperlukan"}), 400
-
-    user = User.query.get(user_id)
-    if not user:
-        return jsonify({"error": "User tidak ditemukan"}), 404
-        
-    event = Event.query.get(event_id)
-    if not event:
-        return jsonify({"error": "Event tidak ditemukan"}), 404
-
-    correct_price = event.price
-
-    existing_invoice = Invoice.query.filter_by(user_id=user.id, event_id=event.id, status='PENDING').first()
-    if existing_invoice:
-        return jsonify({"error": "Anda sudah memiliki transaksi pending untuk event ini."}), 409
-
-    try:
-        xendit_instance = Xendit(api_key=current_app.config['XENDIT_API_KEY'])
-        external_id = f"va-flask-{uuid.uuid4()}"
-        
-        created_va = xendit_instance.VirtualAccount.create(
-            external_id=external_id,
-            bank_code=bank_code,
-            name=user.name,
-            expected_amount=correct_price,
-            is_closed=True,
-        )
-
-        new_invoice = Invoice(
-            external_id=external_id,
-            user_id=user.id,
-            event_id=event.id,
-            amount=correct_price,
-            status='PENDING',
-            invoice_url=None
-        )
-        db.session.add(new_invoice)
-        db.session.commit()
-        
-        return jsonify({
-            "message": "Virtual Account berhasil dibuat.",
-            "payment_details": {
-                "external_id": created_va.external_id,
-                "bank_code": created_va.bank_code,
-                "account_number": created_va.account_number,
-                "expected_amount": created_va.expected_amount,
-                "name": created_va.name,
-                "expiration_date": created_va.expiration_date
-            }
-        })
-    except XenditError as e:
-        return jsonify({"error": f"Error dari Xendit: {e.error_code}"}), 500
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": f"Terjadi kesalahan: {e}"}), 500
-    
 @user_bp.route("/my-tickets", methods=["GET"])
 @require_api_key
 @jwt_required()
 def get_my_tickets():
     """Endpoint untuk user di Flutter meminta daftar tiket aktif mereka."""
+    # Disarankan untuk menggunakan get_jwt_identity() untuk keamanan
     user_id = request.args.get('user_id')
     if not user_id:
         return jsonify({"error": "user_id diperlukan"}), 400
@@ -173,6 +36,7 @@ def get_my_tickets():
 
     tickets_data = []
     for ticket in active_tickets:
+        # Asumsi qrcode sudah digenerate sebelumnya dan disimpan dengan nama ticket_code.png
         qr_code_url = f"{request.host_url}static/qrcodes/{ticket.ticket_code}.png"
         
         tickets_data.append({
@@ -189,17 +53,19 @@ def get_my_tickets():
 @require_api_key
 @jwt_required()
 def user_get_tables():
+    """Endpoint untuk user melihat daftar semua meja."""
     tables = Table.query.all()
     return jsonify([
         {"id": t.id, "name": t.name, "type": t.type, "capacity": t.capacity}
         for t in tables
     ])
 
-# List semua event yang aktif
+
 @user_bp.route("/events", methods=["GET"])
 @require_api_key
 @jwt_required()
 def user_get_events():
+    """Endpoint untuk user melihat daftar event yang aktif."""
     events = Event.query.filter_by(is_active=True).all()
     return jsonify([
         {
@@ -209,31 +75,66 @@ def user_get_events():
             "event_date": e.event_date.isoformat(),
             "start_time": str(e.start_time),
             "end_time": str(e.end_time),
-            "price": e.price
+            # "price": e.price # Anda mungkin ingin menyesuaikan cara harga ditampilkan
         }
         for e in events
     ])
 
-# Detail 1 event (beserta table yang tersedia)
+
 @user_bp.route("/events/<int:event_id>", methods=["GET"])
 @require_api_key
 @jwt_required()
 def user_get_event_detail(event_id):
+    """Endpoint untuk user melihat detail satu event beserta meja yang tersedia."""
     event = Event.query.get_or_404(event_id)
+    
+    # Menambahkan detail gambar dari event itu sendiri
+    event_image_url = event.image_url if event.image_url else None
+
     return jsonify({
         "id": event.id,
         "name": event.name,
         "description": event.description,
+        "image_url": event_image_url, # <-- Menampilkan gambar event
         "event_date": event.event_date.isoformat(),
         "start_time": str(event.start_time),
         "end_time": str(event.end_time),
-        "price": event.price,
         "tables": [
             {
-                "table_id": et.table_id,
-                "status": et.status.value,
-                "price": et.price
+                # ID unik untuk hubungan event-meja, ini yang dikirim saat reservasi
+                "event_table_id": et.id, 
+                "table_id": et.table.id,
+                "table_name": et.table.name,       # <-- Detail tambahan
+                "table_capacity": et.table.capacity, # <-- Detail tambahan
+                "table_price": et.table.price,       # <-- Detail tambahan
+                "status": et.status.value
             }
             for et in event.event_tables
         ]
     })
+
+@user_bp.route("/products", methods=["GET"])
+@require_api_key
+@jwt_required()
+def user_get_products():
+    """Endpoint untuk user melihat semua produk yang tersedia."""
+    try:
+        products = Product.query.filter(Product.stock > 0).all()
+        
+        products_list = [
+            {
+                "id": p.id,
+                "name": p.name,
+                "description": p.description,
+                "price": p.price,
+                "stock": p.stock,
+                "image_url": p.image_url
+            }
+            for p in products
+        ]
+        
+        return jsonify(products_list)
+        
+    except Exception as e:
+        current_app.logger.error(f"Gagal mengambil data produk: {e}")
+        return jsonify({"error": "Terjadi kesalahan pada server saat mengambil data produk."}), 500

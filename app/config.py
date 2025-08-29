@@ -27,5 +27,12 @@ class Config:
     
     SQLALCHEMY_DATABASE_URI = f"mysql+mysqlconnector://{DB_USER}:{DB_PASS}@{DB_HOST}/{DB_NAME}"
     SQLALCHEMY_TRACK_MODIFICATIONS = False
-    UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'static/event_images')
+    BASE_STATIC = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'static')
+
+    UPLOAD_FOLDERS = {
+       "products": os.path.join(BASE_STATIC, "product_images"),
+       "events": os.path.join(BASE_STATIC, "event_images"),
+       "banners": os.path.join(BASE_STATIC, "qrcodes")
+    }
+    
     ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}

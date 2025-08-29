@@ -2,10 +2,7 @@ from datetime import datetime, timedelta
 from flask import Blueprint, render_template, request, jsonify, current_app
 from flask_mail import Message
 from flask_jwt_extended import create_access_token
-from xendit import Xendit, XenditError
-from ..models import User, Invoice, Ticket
-import qrcode
-import os
+from ..models import User
 import secrets
 import uuid
 from .. import db, bcrypt, mail
@@ -51,7 +48,7 @@ def handle_admin_register():
         "user_id": new_user.id
     }), 201
 
-@auth_bp.route("/register/user", methods=["POST"]) # PERBAIKAN: Menambahkan .route
+@auth_bp.route("/register/user", methods=["POST"])
 @require_api_key
 def handle_user_register():
     """Mendaftarkan pengguna baru sebagai USER BIASA."""
@@ -144,25 +141,20 @@ def handle_admin_login():
 
 @auth_bp.route("/request-password-reset", methods=["POST"])
 def request_password_reset():
-    # Coba ambil data dari JSON
     data = request.get_json()
     email = None
     
     if data:
         email = data.get('email')
     else:
-        # Kalau tidak ada JSON, coba dari form biasa
         email = request.form.get('email')
     
-    # Validasi email
     if not email:
-        return "Email harus diisi", 400  # Kembalikan error jika email kosong
+        return jsonify({"error": "Email harus diisi"}), 400
 
-    # Cari user berdasarkan email
     user = User.query.filter_by(email=email.lower()).first()
     
     if user:
-
         token = secrets.token_urlsafe(32)
         user.reset_token = token
         user.reset_token_expiration = datetime.utcnow() + timedelta(hours=1)
@@ -173,21 +165,20 @@ def request_password_reset():
         try:
             msg = Message(
                 subject="Link Reset Password Anda",
-                sender=current_app.config.get('MAIL_DEFAULT_SENDER') or current_app.config.get('MAIL_USERNAME'),
+                sender=current_app.config.get('MAIL_DEFAULT_SENDER'),
                 recipients=[user.email]
             )
             msg.body = f"Halo {user.name},\n\nKlik link ini untuk reset password:\n{reset_link}\n\nLink berlaku 1 jam."
             mail.send(msg)
-            
             current_app.logger.info(f"Email reset password dikirim ke {user.email}")
-            
         except Exception as e:
             current_app.logger.error(f"GAGAL KIRIM EMAIL: {str(e)}")
-            return f"Error mengirim email: {str(e)}", 500
+            return jsonify({"error": f"Error mengirim email: {str(e)}"}), 500
         
-        return "Link reset sudah dikirim ke email Anda"
+        return jsonify({"message": "Link reset sudah dikirim ke email Anda. Silakan periksa inbox atau spam."})
     else:
-        return "Email tidak ditemukan", 404
+        # Untuk keamanan, kita tetap berikan respons sukses agar tidak bisa menebak email mana yang terdaftar
+        return jsonify({"message": "Jika email Anda terdaftar, link reset akan dikirim."})
 
 @auth_bp.route("/reset-password/<token>", methods=["POST"])
 def reset_password(token):
@@ -204,9 +195,10 @@ def reset_password(token):
         user.reset_token_expiration = None
         db.session.commit()
         
-        return ("Password Anda Berhasil Diganti!!")
+        # Sebaiknya kembalikan ke halaman sukses, bukan hanya teks
+        return "Password Anda berhasil diganti! Silakan login kembali."
     else:
-        return "Link sudah kadaluarsa atau tidak valid", 400
+        return "Link sudah kedaluwarsa atau tidak valid", 400
 
 @auth_bp.route("/halaman-reset-password/<token>", methods=["GET"])
 def halaman_reset_password(token):
@@ -216,132 +208,3 @@ def halaman_reset_password(token):
         return render_template("reset_password_form.html", token=token)
     else:
         return "Token tidak valid atau sudah kedaluwarsa", 400
-
-def create_xendit_invoice(amount, description, payer_email):
-    """Fungsi bantuan untuk membuat invoice di Xendit menggunakan SDK."""
-    try:
-        xendit_instance = Xendit(api_key=current_app.config['XENDIT_API_KEY'])
-        external_id = f"invoice-flask-{uuid.uuid4()}"
-        
-        created_invoice = xendit_instance.Invoice.create(
-            external_id=external_id,
-            payer_email=payer_email,
-            description=description,
-            amount=amount
-        )
-        return created_invoice, None
-    except XenditError as e:
-        return None, f"Error dari Xendit: {e.error_code}"
-    except Exception as e:
-        return None, f"Terjadi kesalahan tak terduga: {e}"
-
-@auth_bp.route("/xendit-webhook", methods=["POST"])
-def xendit_webhook():
-    """
-    Endpoint untuk menerima callback dari Xendit, memperbarui status,
-    dan mengirimkan BUKTI PEMBAYARAN / E-TIKET jika pembayaran berhasil.
-    """
-    callback_token = request.headers.get('x-callback-token')
-    # Sesuaikan dengan nama variabel di config.py jika berbeda
-    if callback_token != current_app.config['XENDIT_WEBHOOK_VERIFICATION_TOKEN']:
-        current_app.logger.warning("Webhook dengan callback token tidak valid diterima.")
-        return jsonify({"error": "Invalid callback token"}), 403
-
-    data = request.get_json()
-    current_app.logger.info(f"Webhook diterima dari Xendit: {data}")
-
-    try:
-        invoice_external_id = data.get('external_id')
-        invoice_status = data.get('status')
-
-        invoice_to_update = Invoice.query.filter_by(external_id=invoice_external_id).first()
-
-        if not invoice_to_update:
-            current_app.logger.warning(f"Invoice dengan external_id {invoice_external_id} tidak ditemukan.")
-            return jsonify({"status": "ok", "message": "Invoice not found"}), 200
-
-        invoice_to_update.status = invoice_status
-        db.session.commit()
-        current_app.logger.info(f"Status invoice {invoice_external_id} diperbarui menjadi {invoice_status}")
-
-        if invoice_status == 'PAID' and not invoice_to_update.ticket:
-            event = invoice_to_update.event
-            
-            new_ticket = Ticket(
-                ticket_code=secrets.token_hex(16),
-                invoice_id=invoice_to_update.id,
-                user_id=invoice_to_update.user_id,
-                event_id=event.id,
-                expires_at=event.event_date
-            )
-            db.session.add(new_ticket)
-            db.session.commit()
-            current_app.logger.info(f"Tiket {new_ticket.ticket_code} berhasil dibuat untuk event '{event.name}'")
-
-            # Buat gambar QR Code
-            qr_img = qrcode.make(new_ticket.ticket_code)
-            qr_code_dir = os.path.join(current_app.root_path, 'static', 'qrcodes')
-            os.makedirs(qr_code_dir, exist_ok=True)
-            qr_image_path = os.path.join(qr_code_dir, f'{new_ticket.ticket_code}.png')
-            qr_img.save(qr_image_path)
-
-            # --- PERUBAHAN UTAMA: Konten Email Dibuat Lebih Detail ---
-            
-            # Format tanggal dan harga agar lebih rapi
-            payment_date = datetime.now().strftime('%d %B %Y, %H:%M:%S WIB')
-            formatted_price = "Rp {:,}".format(event.price).replace(',', '.')
-
-            msg = Message(
-                subject=f"Bukti Pembayaran & E-Tiket untuk {event.name}",
-                recipients=[invoice_to_update.user.email]
-            )
-            msg.html = f"""
-            <div style="font-family: Arial, sans-serif; line-height: 1.6;">
-                <h2>Halo {invoice_to_update.user.name},</h2>
-                <p>Terima kasih! Pembayaran Anda telah berhasil kami terima.</p>
-                
-                <h3>Detail Invoice</h3>
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr style="border-bottom: 1px solid #ddd;">
-                        <td style="padding: 8px;">No. Invoice</td>
-                        <td style="padding: 8px;">: <strong>{invoice_to_update.external_id}</strong></td>
-                    </tr>
-                    <tr style="border-bottom: 1px solid #ddd;">
-                        <td style="padding: 8px;">Tanggal Pembayaran</td>
-                        <td style="padding: 8px;">: {payment_date}</td>
-                    </tr>
-                    <tr style="border-bottom: 1px solid #ddd;">
-                        <td style="padding: 8px;">Item</td>
-                        <td style="padding: 8px;">: Tiket untuk <strong>{event.name}</strong></td>
-                    </tr>
-                    <tr style="border-bottom: 1px solid #ddd;">
-                        <td style="padding: 8px;">Jumlah</td>
-                        <td style="padding: 8px;">: <strong>{formatted_price}</strong></td>
-                    </tr>
-                </table>
-
-                <hr>
-
-                <h3>E-Tiket Anda</h3>
-                <p>Berikut adalah E-Tiket Anda. Silakan tunjukkan QR Code ini kepada petugas kami di lokasi.</p>
-                <p>Kode Tiket: <strong>{new_ticket.ticket_code}</strong></p>
-                <p><i>QR Code terlampir dalam email ini.</i></p>
-            </div>
-            """
-            
-            # Lampirkan QR code ke email
-            with current_app.open_resource(qr_image_path) as fp:
-                msg.attach(f"{new_ticket.ticket_code}.png", "image/png", fp.read())
-            
-            mail.send(msg)
-            current_app.logger.info(f"Email E-Tiket dikirim ke {invoice_to_update.user.email}")
-
-            # Opsional: Hapus file QR code dari server setelah dikirim
-            # os.remove(qr_image_path)
-
-    except Exception as e:
-        db.session.rollback()
-        current_app.logger.error(f"Error memproses webhook Xendit: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-    return jsonify({"status": "success"}), 200
